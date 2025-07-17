@@ -42,6 +42,8 @@ Thumbs.db
 
 # Runtime directories and files
 logs/
+.backup/
+demo-folder/
 
 # Temporary files
 *.tmp

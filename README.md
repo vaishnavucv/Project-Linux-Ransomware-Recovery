@@ -53,7 +53,7 @@ A comprehensive Proof of Concept (PoC) for Linux ransomware recovery using Go, f
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
+git clone https://github.com/vaishnavucv/Project-Linux-Ransomware-Recovery
 cd Project-Linux-Ransomware-Recovery
 ```
 
