@@ -1,0 +1,34 @@
+{
+  "monitor_path": "./demo-folder",
+  "backup_path": "./.backup",
+  "log_path": "./logs",
+  "detection": {
+    "suspicious_extensions": [
+      ".locked",
+      ".encrypted",
+      ".crypto",
+      ".crypt",
+      ".enc"
+    ],
+    "threshold": 3,
+    "time_window": 60,
+    "real_time_detection": true,
+    "content_patterns": [
+      "RANSOMWARE",
+      "DECRYPT",
+      "BITCOIN",
+      "PAYMENT"
+    ]
+  },
+  "backup": {
+    "auto_backup": true,
+    "retention_days": 30,
+    "enable_checksums": true,
+    "compression": false
+  },
+  "system": {
+    "worker_count": 4,
+    "buffer_size": 100,
+    "operation_timeout": 30
+  }
+}
