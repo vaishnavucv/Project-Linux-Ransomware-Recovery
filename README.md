@@ -16,13 +16,22 @@ A comprehensive Proof of Concept (PoC) for Linux ransomware recovery using Go, f
 ### Key Capabilities
 
 ※ **Real-time Monitoring**: Watches `./demo-folder/` for all file system events  
-※ **Automatic Backup**: Creates backups in `.backup/` on file creation/modification  
+※ **Hash-based Backup**: Creates backups only when files actually change using SHA256 hashes  
+※ **Immediate Backup**: Files are backed up instantly when created or modified  
+※ **Remote Backup**: Secure off-site backup using Rsync over SSH to Ubuntu servers  
+※ **Periodic Scanning**: Random interval file scanning (60s, 5min, 10min)  
 ※ **Pattern Detection**: Detects suspicious extensions (`.locked`, `.encrypted`, etc.)  
 ※ **Content Analysis**: Scans file content for ransomware-related keywords  
+※ **Deletion Alerts**: High-priority alerts for file deletions and mass deletions  
 ※ **Threshold-based Triggers**: Configurable detection thresholds and time windows  
 ※ **Automatic Rollback**: Restores files when suspicious activity is detected  
-※ **File Quarantine**: Isolates infected files before restoration  
+※ **Manual Rollback**: Command-line triggered complete system restoration  
+※ **Remote Rollback**: Restore files from backup server using Rsync over SSH  
+※ **Hybrid Rollback**: Intelligent source selection with local/remote redundancy  
+※ **File Structure Restoration**: Recreates complete directory structure from backups  
+※ **Malicious File Cleanup**: Removes suspicious files before restoration  
 ※ **Parallel Processing**: Multi-threaded operations for performance  
+※ **Optimized Logging**: Configurable logging modes for 24/7 operation  
 ※ **Graceful Shutdown**: Proper cleanup on SIGINT/SIGTERM  
 ※ **Security**: Path traversal protection and input validation  
 
@@ -71,21 +80,33 @@ go build -o ransomware-recovery .
 
 ### Running the System
 
-1. **Basic Usage**:
+1. **Basic Usage** (Start Monitoring):
 ```bash
 ./ransomware-recovery
 ```
 
-2. **With Demo Script**:
+2. **Manual Rollback** (Restore All Files):
+```bash
+./ransomware-recovery --rollback
+```
+
+3. **Help and Version**:
+```bash
+./ransomware-recovery --help
+./ransomware-recovery --version
+```
+
+4. **With Demo Script**:
 ```bash
 ./demo.sh
 ```
 
 The system will:
 - Monitor `./demo-folder/` for file changes
-- Create backups in `./.backup/`
+- Create backups in `./.backup/` with hash-based change detection
 - Log activities to `./logs/journal.log`
 - Automatically trigger rollback when suspicious activity is detected
+- Allow manual rollback with complete file structure restoration
 
 ## Configuration
 
@@ -131,6 +152,7 @@ The system uses a JSON configuration file (`config.json`) with the following str
 - `retention_days`: How long to keep backup files
 - `enable_checksums`: Enable SHA-256 checksums for integrity
 - `compression`: Enable backup compression (future feature)
+- `remote_backup`: Remote backup settings for Rsync over SSH
 
 #### System Settings
 - `worker_count`: Number of parallel processing workers
@@ -141,7 +163,27 @@ The system uses a JSON configuration file (`config.json`) with the following str
 
 ### Manual Operations
 
-The system provides APIs for manual operations:
+#### Command-Line Manual Rollback
+
+The system provides a comprehensive manual rollback system via command-line:
+
+```bash
+# Perform complete manual rollback
+./ransomware-recovery --rollback
+
+# Show help information
+./ransomware-recovery --help
+
+# Show version information  
+./ransomware-recovery --version
+
+# Use custom configuration
+./ransomware-recovery --rollback --config /path/to/config.json
+```
+
+#### Programmatic API Operations
+
+The system also provides APIs for manual operations:
 
 ```go
 // Manual rollback

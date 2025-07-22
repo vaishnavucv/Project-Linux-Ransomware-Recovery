@@ -18,17 +18,61 @@
       "DECRYPT",
       "BITCOIN",
       "PAYMENT"
-    ]
+    ],
+    "deletion_alert": {
+      "enabled": true,
+      "mass_threshold": 5,
+      "time_window": 2,
+      "alert_on_valuable_files": true,
+      "alert_on_no_backup": true,
+      "large_file_threshold": 1
+    }
   },
   "backup": {
     "auto_backup": true,
     "retention_days": 30,
     "enable_checksums": true,
-    "compression": false
+    "compression": false,
+    "remote_backup": {
+      "enabled": false,
+      "host": "your-backup-server.com",
+      "username": "backup-user",
+      "port": 22,
+      "remote_path": "/home/backup-user/ransomware-backups",
+      "ssh_key_path": "",
+      "rsync_options": ["-avz", "--delete", "--partial", "--progress"],
+      "sync_interval": 5,
+      "connection_timeout": 30,
+      "max_retries": 3,
+      "retry_delay": 10,
+      "enable_compression": true,
+      "bandwidth_limit": 0,
+      "remote_rollback": {
+        "enabled": false,
+        "prefer_remote": true,
+        "backup_before_rollback": true,
+        "verify_integrity": true,
+        "rollback_options": ["-avz", "--delete", "--partial", "--progress"],
+        "temp_dir": "./.temp-rollback"
+      }
+    }
   },
   "system": {
     "worker_count": 4,
     "buffer_size": 100,
-    "operation_timeout": 30
+    "operation_timeout": 30,
+    "periodic_scan": {
+      "enabled": true,
+      "random_intervals": [60, 300, 600],
+      "deep_analysis": true,
+      "max_files_per_batch": 100,
+      "scan_timeout_ms": 5000
+    }
+  },
+  "logging": {
+    "long_term_mode": true,
+    "summary_interval": 10,
+    "max_log_size": 50,
+    "max_log_files": 3
   }
 }

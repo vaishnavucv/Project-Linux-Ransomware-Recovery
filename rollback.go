@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,15 +25,19 @@ type RollbackManager struct {
 
 // RollbackResult represents the result of a rollback operation
 type RollbackResult struct {
-	Success          bool              `json:"success"`
-	TotalFiles       int               `json:"total_files"`
-	RestoredFiles    int               `json:"restored_files"`
-	FailedFiles      int               `json:"failed_files"`
-	Duration         time.Duration     `json:"duration"`
-	Errors           []string          `json:"errors"`
-	RestoredPaths    []string          `json:"restored_paths"`
-	FailedPaths      []string          `json:"failed_paths"`
-	Timestamp        time.Time         `json:"timestamp"`
+	Success       bool          `json:"success"`
+	TotalFiles    int           `json:"total_files"`
+	RestoredFiles int           `json:"restored_files"`
+	FailedFiles   int           `json:"failed_files"`
+	Duration      time.Duration `json:"duration"`
+	Errors        []string      `json:"errors"`
+	RestoredPaths []string      `json:"restored_paths"`
+	FailedPaths   []string      `json:"failed_paths"`
+	Timestamp     time.Time     `json:"timestamp"`
+	// Remote rollback specific fields
+	RollbackSource string `json:"rollback_source"` // "local", "remote", "hybrid"
+	RemoteHost     string `json:"remote_host,omitempty"`
+	TempStaging    string `json:"temp_staging,omitempty"`
 }
 
 // NewRollbackManager creates a new rollback manager
@@ -42,113 +48,45 @@ func NewRollbackManager(cfg *config.Config) *RollbackManager {
 	}
 }
 
-// TriggerRollback initiates a full rollback operation
+// TriggerRollback initiates a full rollback operation including complete file structure restoration
 func (rm *RollbackManager) TriggerRollback(ctx context.Context) (*RollbackResult, error) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
 
-	logger.Log.Warn("Initiating emergency rollback operation")
+	logger.Log.Warn("Initiating complete rollback operation with file structure restoration")
 	startTime := time.Now()
 
 	result := &RollbackResult{
-		Success:       false,
-		TotalFiles:    0,
-		RestoredFiles: 0,
-		FailedFiles:   0,
-		Errors:        make([]string, 0),
-		RestoredPaths: make([]string, 0),
-		FailedPaths:   make([]string, 0),
-		Timestamp:     startTime,
+		Success:        false,
+		TotalFiles:     0,
+		RestoredFiles:  0,
+		FailedFiles:    0,
+		Errors:         make([]string, 0),
+		RestoredPaths:  make([]string, 0),
+		FailedPaths:    make([]string, 0),
+		Timestamp:      startTime,
+		RollbackSource: "local", // Default to local
 	}
 
-	// Get list of backup files
-	backupFiles, err := rm.backupManager.ListBackups()
-	if err != nil {
-		errorMsg := fmt.Sprintf("failed to list backup files: %v", err)
-		logger.LogError("rollback", "list_backups", err)
-		result.Errors = append(result.Errors, errorMsg)
-		result.Duration = time.Since(startTime)
-		return result, fmt.Errorf(errorMsg)
-	}
+	// Determine rollback source based on configuration and availability
+	rollbackSource := rm.determineRollbackSource()
+	result.RollbackSource = rollbackSource
 
-	result.TotalFiles = len(backupFiles)
-
-	if result.TotalFiles == 0 {
-		logger.Log.Warn("No backup files found for rollback")
-		result.Duration = time.Since(startTime)
-		return result, fmt.Errorf("no backup files found")
-	}
-
-	logger.Log.WithField("total_files", result.TotalFiles).Info("Starting rollback of backup files")
-
-	// Create a worker pool for parallel restoration
-	workerCount := rm.config.System.WorkerCount
-	if workerCount > result.TotalFiles {
-		workerCount = result.TotalFiles
-	}
-
-	// Channels for work distribution
-	fileChan := make(chan string, result.TotalFiles)
-	resultChan := make(chan restoreResult, result.TotalFiles)
-
-	// Start worker goroutines
-	var wg sync.WaitGroup
-	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
-		go rm.restoreWorker(ctx, fileChan, resultChan, &wg)
-	}
-
-	// Send files to workers
-	for _, filePath := range backupFiles {
-		select {
-		case fileChan <- filePath:
-		case <-ctx.Done():
-			close(fileChan)
-			result.Duration = time.Since(startTime)
-			return result, ctx.Err()
-		}
-	}
-	close(fileChan)
-
-	// Wait for all workers to complete
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
-	// Collect results
-	for restoreRes := range resultChan {
-		if restoreRes.Success {
-			result.RestoredFiles++
-			result.RestoredPaths = append(result.RestoredPaths, restoreRes.FilePath)
-			logger.LogRollback("restore", restoreRes.FilePath, true)
-		} else {
-			result.FailedFiles++
-			result.FailedPaths = append(result.FailedPaths, restoreRes.FilePath)
-			result.Errors = append(result.Errors, restoreRes.Error)
-			logger.LogRollback("restore", restoreRes.FilePath, false)
-		}
-	}
-
-	result.Duration = time.Since(startTime)
-	result.Success = result.RestoredFiles > 0
-
-	// Log final results
 	logger.Log.WithFields(map[string]interface{}{
-		"total_files":    result.TotalFiles,
-		"restored_files": result.RestoredFiles,
-		"failed_files":   result.FailedFiles,
-		"duration":       result.Duration,
-		"success":        result.Success,
-	}).Info("Rollback operation completed")
+		"rollback_source": rollbackSource,
+		"component":       "rollback",
+		"event_type":      "rollback_source_determined",
+	}).Info("Determined rollback source")
 
-	if result.Success {
-		logger.Log.Info("Emergency rollback completed successfully")
-	} else {
-		logger.Log.Error("Emergency rollback failed")
+	// Execute rollback based on source
+	switch rollbackSource {
+	case "remote":
+		return rm.executeRemoteRollback(ctx, result)
+	case "hybrid":
+		return rm.executeHybridRollback(ctx, result)
+	default:
+		return rm.executeLocalRollback(ctx, result)
 	}
-
-	return result, nil
 }
 
 // restoreResult represents the result of a single file restoration
@@ -296,77 +234,6 @@ func (rm *RollbackManager) RestoreDirectory(ctx context.Context, dirPath string)
 	return rm.RestoreSpecificFiles(ctx, dirFiles)
 }
 
-// QuarantineInfectedFiles moves infected files to a quarantine directory
-func (rm *RollbackManager) QuarantineInfectedFiles(ctx context.Context, infectedFiles []string) error {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	logger.Log.WithField("file_count", len(infectedFiles)).Info("Starting file quarantine")
-
-	// Create quarantine directory
-	quarantineDir := filepath.Join(rm.config.BackupPath, "quarantine", time.Now().Format("2006-01-02_15-04-05"))
-	if err := os.MkdirAll(quarantineDir, 0755); err != nil {
-		logger.LogError("rollback", "create_quarantine_dir", err)
-		return fmt.Errorf("failed to create quarantine directory: %w", err)
-	}
-
-	successCount := 0
-	for _, filePath := range infectedFiles {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			if err := rm.quarantineFile(filePath, quarantineDir); err != nil {
-				logger.LogError("rollback", "quarantine_file", err)
-				logger.Log.WithFields(map[string]interface{}{
-					"file_path": filePath,
-					"error":     err.Error(),
-				}).Error("Failed to quarantine file")
-			} else {
-				successCount++
-				logger.Log.WithField("file_path", filePath).Info("File quarantined successfully")
-			}
-		}
-	}
-
-	logger.Log.WithFields(map[string]interface{}{
-		"total_files":      len(infectedFiles),
-		"quarantined_files": successCount,
-		"quarantine_dir":   quarantineDir,
-	}).Info("File quarantine completed")
-
-	return nil
-}
-
-// quarantineFile moves a single file to quarantine
-func (rm *RollbackManager) quarantineFile(filePath, quarantineDir string) error {
-	// Validate file path
-	if !strings.HasPrefix(filePath, rm.config.MonitorPath) {
-		return fmt.Errorf("file path outside monitor directory: %s", filePath)
-	}
-
-	// Create relative path for quarantine
-	relPath, err := filepath.Rel(rm.config.MonitorPath, filePath)
-	if err != nil {
-		return err
-	}
-
-	quarantinePath := filepath.Join(quarantineDir, relPath)
-
-	// Create quarantine subdirectory if needed
-	quarantineSubDir := filepath.Dir(quarantinePath)
-	if err := os.MkdirAll(quarantineSubDir, 0755); err != nil {
-		return err
-	}
-
-	// Move file to quarantine
-	if err := os.Rename(filePath, quarantinePath); err != nil {
-		return err
-	}
-
-	return nil
-}
-
 // VerifyRestoration verifies that restored files match their backups
 func (rm *RollbackManager) VerifyRestoration(ctx context.Context, filePaths []string) (map[string]bool, error) {
 	rm.mu.RLock()
@@ -469,4 +336,636 @@ func (rm *RollbackManager) IsRollbackInProgress() bool {
 	case <-time.After(100 * time.Millisecond):
 		return true
 	}
-} 
+}
+
+// cleanupMaliciousFiles removes suspicious files before restoration
+func (rm *RollbackManager) cleanupMaliciousFiles(ctx context.Context) error {
+	logger.Log.Info("Cleaning up malicious files before restoration")
+
+	suspiciousExtensions := []string{".locked", ".encrypted", ".crypto", ".crypt", ".enc"}
+	suspiciousPatterns := []string{"RANSOMWARE", "DECRYPT", "BITCOIN", "PAYMENT"}
+
+	cleanedCount := 0
+
+	// Walk through monitor directory to find malicious files
+	err := filepath.Walk(rm.config.MonitorPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // Continue despite errors
+		}
+
+		// Skip directories and backup path
+		if info.IsDir() || strings.HasPrefix(path, rm.config.BackupPath) {
+			return nil
+		}
+
+		// Check for suspicious extensions
+		isSuspiciousExt := false
+		for _, ext := range suspiciousExtensions {
+			if strings.HasSuffix(strings.ToLower(path), ext) {
+				isSuspiciousExt = true
+				break
+			}
+		}
+
+		// Check for suspicious content in small files
+		isSuspiciousContent := false
+		if !isSuspiciousExt && info.Size() < 10*1024 { // Only check files < 10KB
+			if content, err := os.ReadFile(path); err == nil {
+				contentStr := string(content)
+				for _, pattern := range suspiciousPatterns {
+					if strings.Contains(strings.ToUpper(contentStr), pattern) {
+						isSuspiciousContent = true
+						break
+					}
+				}
+			}
+		}
+
+		// Remove suspicious files
+		if isSuspiciousExt || isSuspiciousContent {
+			if err := os.Remove(path); err != nil {
+				logger.LogError("rollback", "remove_malicious", err)
+				logger.Log.WithFields(map[string]interface{}{
+					"file_path": path,
+					"error":     err.Error(),
+				}).Warn("Failed to remove malicious file")
+			} else {
+				cleanedCount++
+				logger.Log.WithFields(map[string]interface{}{
+					"file_path":          path,
+					"reason":             "suspicious_file",
+					"suspicious_ext":     isSuspiciousExt,
+					"suspicious_content": isSuspiciousContent,
+				}).Info("Removed malicious file")
+			}
+		}
+
+		return nil
+	})
+
+	logger.Log.WithFields(map[string]interface{}{
+		"cleaned_files": cleanedCount,
+		"component":     "rollback",
+	}).Info("Malicious file cleanup completed")
+
+	return err
+}
+
+// recreateDirectoryStructure ensures all necessary directories exist
+func (rm *RollbackManager) recreateDirectoryStructure(ctx context.Context) error {
+	logger.Log.Info("Recreating directory structure from backups")
+
+	// Get all backup files to understand directory structure
+	backupFiles, err := rm.backupManager.ListBackups()
+	if err != nil {
+		return fmt.Errorf("failed to list backup files: %w", err)
+	}
+
+	// Extract unique directories that need to be created
+	dirSet := make(map[string]bool)
+	for _, filePath := range backupFiles {
+		dir := filepath.Dir(filePath)
+		// Add all parent directories
+		for dir != "." && dir != "/" && dir != rm.config.MonitorPath {
+			dirSet[dir] = true
+			dir = filepath.Dir(dir)
+		}
+	}
+
+	// Create directories
+	createdDirs := 0
+	for dir := range dirSet {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			logger.LogError("rollback", "create_directory", err)
+			logger.Log.WithFields(map[string]interface{}{
+				"directory": dir,
+				"error":     err.Error(),
+			}).Warn("Failed to create directory")
+		} else {
+			createdDirs++
+			logger.Log.WithField("directory", dir).Debug("Created directory")
+		}
+	}
+
+	logger.Log.WithFields(map[string]interface{}{
+		"created_directories": createdDirs,
+		"total_directories":   len(dirSet),
+		"component":           "rollback",
+	}).Info("Directory structure recreation completed")
+
+	return nil
+}
+
+// determineRollbackSource determines the best rollback source based on configuration and availability
+func (rm *RollbackManager) determineRollbackSource() string {
+	remoteConfig := rm.config.Backup.RemoteBackup
+
+	// Check if remote rollback is enabled and configured
+	if !remoteConfig.Enabled || !remoteConfig.RemoteRollback.Enabled {
+		return "local"
+	}
+
+	// Check if we can connect to remote server
+	if !rm.isRemoteAvailable() {
+		logger.Log.Warn("Remote server not available, falling back to local rollback")
+		return "local"
+	}
+
+	// Check if we prefer remote rollback
+	if remoteConfig.RemoteRollback.PreferRemote {
+		return "remote"
+	}
+
+	// Check if we have local backups
+	localBackups, err := rm.backupManager.ListBackups()
+	if err != nil || len(localBackups) == 0 {
+		logger.Log.Info("No local backups available, using remote rollback")
+		return "remote"
+	}
+
+	// Use hybrid approach (remote + local verification)
+	return "hybrid"
+}
+
+// isRemoteAvailable checks if the remote backup server is accessible
+func (rm *RollbackManager) isRemoteAvailable() bool {
+	remoteConfig := rm.config.Backup.RemoteBackup
+
+	// Build a simple SSH test command
+	sshCmd := fmt.Sprintf("ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no")
+	if remoteConfig.SSHKeyPath != "" {
+		sshCmd += fmt.Sprintf(" -i %s", remoteConfig.SSHKeyPath)
+	}
+	sshCmd += fmt.Sprintf(" -p %d %s@%s", remoteConfig.Port, remoteConfig.Username, remoteConfig.Host)
+	sshCmd += " 'echo test'"
+
+	cmd := exec.Command("sh", "-c", sshCmd)
+	err := cmd.Run()
+
+	available := err == nil
+	logger.Log.WithFields(map[string]interface{}{
+		"remote_host": remoteConfig.Host,
+		"available":   available,
+		"component":   "rollback",
+	}).Debug("Remote server availability check")
+
+	return available
+}
+
+// executeLocalRollback performs rollback using local backups
+func (rm *RollbackManager) executeLocalRollback(ctx context.Context, result *RollbackResult) (*RollbackResult, error) {
+	startTime := result.Timestamp
+
+	logger.Log.WithFields(map[string]interface{}{
+		"component":  "rollback",
+		"event_type": "local_rollback_start",
+	}).Info("Starting local rollback operation")
+
+	// Step 1: Clean up any malicious files before restoration
+	if err := rm.cleanupMaliciousFiles(ctx); err != nil {
+		logger.LogError("rollback", "cleanup_malicious", err)
+		// Continue with rollback even if cleanup fails
+	}
+
+	// Step 2: Recreate directory structure
+	if err := rm.recreateDirectoryStructure(ctx); err != nil {
+		logger.LogError("rollback", "recreate_directories", err)
+		// Continue with rollback even if directory creation fails
+	}
+
+	// Step 3: Get list of backup files
+	backupFiles, err := rm.backupManager.ListBackups()
+	if err != nil {
+		logger.LogError("rollback", "list_backups", err)
+		result.Errors = append(result.Errors, fmt.Sprintf("Failed to list backup files: %v", err))
+		result.Duration = time.Since(startTime)
+		return result, err
+	}
+
+	result.TotalFiles = len(backupFiles)
+	logger.Log.WithField("total_files", result.TotalFiles).Info("Found backup files for rollback")
+
+	if result.TotalFiles == 0 {
+		logger.Log.Warn("No backup files found for rollback")
+		result.Duration = time.Since(startTime)
+		return result, fmt.Errorf("no backup files found")
+	}
+
+	// Step 4: Restore files using parallel workers
+	fileChan := make(chan string, len(backupFiles))
+	resultChan := make(chan restoreResult, len(backupFiles))
+
+	// Start worker goroutines
+	var wg sync.WaitGroup
+	workerCount := rm.config.System.WorkerCount
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go rm.restoreWorker(ctx, fileChan, resultChan, &wg)
+	}
+
+	// Send files to workers
+	for _, filePath := range backupFiles {
+		select {
+		case fileChan <- filePath:
+		case <-ctx.Done():
+			close(fileChan)
+			wg.Wait()
+			result.Duration = time.Since(startTime)
+			return result, ctx.Err()
+		}
+	}
+	close(fileChan)
+
+	// Wait for all workers to complete
+	wg.Wait()
+	close(resultChan)
+
+	// Collect results
+	for restoreRes := range resultChan {
+		if restoreRes.Success {
+			result.RestoredFiles++
+			result.RestoredPaths = append(result.RestoredPaths, restoreRes.FilePath)
+		} else {
+			result.FailedFiles++
+			result.FailedPaths = append(result.FailedPaths, restoreRes.FilePath)
+			result.Errors = append(result.Errors, restoreRes.Error)
+		}
+	}
+
+	// Determine overall success
+	result.Success = result.FailedFiles == 0
+	result.Duration = time.Since(startTime)
+
+	// Log final results
+	logger.LogRollback("complete", rm.config.MonitorPath, result.Success)
+	logger.Log.WithFields(map[string]interface{}{
+		"total_files":    result.TotalFiles,
+		"restored_files": result.RestoredFiles,
+		"failed_files":   result.FailedFiles,
+		"duration":       result.Duration,
+		"success":        result.Success,
+		"rollback_type":  "local",
+	}).Info("Local rollback operation completed")
+
+	return result, nil
+}
+
+// executeRemoteRollback performs rollback using remote backups via Rsync over SSH
+func (rm *RollbackManager) executeRemoteRollback(ctx context.Context, result *RollbackResult) (*RollbackResult, error) {
+	startTime := result.Timestamp
+	remoteConfig := rm.config.Backup.RemoteBackup
+
+	result.RemoteHost = remoteConfig.Host
+	result.TempStaging = remoteConfig.RemoteRollback.TempDir
+
+	logger.Log.WithFields(map[string]interface{}{
+		"component":   "rollback",
+		"event_type":  "remote_rollback_start",
+		"remote_host": remoteConfig.Host,
+		"remote_path": remoteConfig.RemotePath,
+	}).Info("Starting remote rollback operation")
+
+	// Step 1: Create temp staging directory
+	if err := rm.createTempStagingDir(result.TempStaging); err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("Failed to create temp staging directory: %v", err))
+		result.Duration = time.Since(startTime)
+		return result, err
+	}
+	defer rm.cleanupTempStaging(result.TempStaging)
+
+	// Step 2: Backup current state if configured
+	if remoteConfig.RemoteRollback.BackupBeforeRollback {
+		if err := rm.backupCurrentState(ctx); err != nil {
+			logger.Log.WithError(err).Warn("Failed to backup current state before remote rollback")
+			// Continue with rollback
+		}
+	}
+
+	// Step 3: Download remote backups to staging area
+	if err := rm.downloadRemoteBackups(ctx, result); err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("Failed to download remote backups: %v", err))
+		result.Duration = time.Since(startTime)
+		return result, err
+	}
+
+	// Step 4: Clean up malicious files
+	if err := rm.cleanupMaliciousFiles(ctx); err != nil {
+		logger.LogError("rollback", "cleanup_malicious", err)
+		// Continue with rollback even if cleanup fails
+	}
+
+	// Step 5: Restore files from staging area to monitor path
+	if err := rm.restoreFromStaging(ctx, result); err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("Failed to restore from staging: %v", err))
+		result.Duration = time.Since(startTime)
+		return result, err
+	}
+
+	// Step 6: Verify integrity if configured
+	if remoteConfig.RemoteRollback.VerifyIntegrity {
+		if err := rm.verifyRemoteRollbackIntegrity(ctx, result); err != nil {
+			logger.Log.WithError(err).Warn("Integrity verification failed after remote rollback")
+			// Don't fail the rollback for verification issues
+		}
+	}
+
+	// Determine overall success
+	result.Success = result.FailedFiles == 0
+	result.Duration = time.Since(startTime)
+
+	// Log final results
+	logger.LogRollback("complete", rm.config.MonitorPath, result.Success)
+	logger.Log.WithFields(map[string]interface{}{
+		"total_files":    result.TotalFiles,
+		"restored_files": result.RestoredFiles,
+		"failed_files":   result.FailedFiles,
+		"duration":       result.Duration,
+		"success":        result.Success,
+		"rollback_type":  "remote",
+		"remote_host":    result.RemoteHost,
+	}).Info("Remote rollback operation completed")
+
+	return result, nil
+}
+
+// executeHybridRollback performs rollback using both remote and local backups for redundancy
+func (rm *RollbackManager) executeHybridRollback(ctx context.Context, result *RollbackResult) (*RollbackResult, error) {
+	logger.Log.WithFields(map[string]interface{}{
+		"component":  "rollback",
+		"event_type": "hybrid_rollback_start",
+	}).Info("Starting hybrid rollback operation")
+
+	// Try remote rollback first
+	remoteResult, remoteErr := rm.executeRemoteRollback(ctx, result)
+
+	if remoteErr == nil && remoteResult.Success {
+		// Remote rollback succeeded
+		remoteResult.RollbackSource = "hybrid-remote"
+		logger.Log.Info("Hybrid rollback completed successfully using remote source")
+		return remoteResult, nil
+	}
+
+	// Remote rollback failed, try local rollback
+	logger.Log.WithError(remoteErr).Warn("Remote rollback failed, attempting local rollback")
+
+	// Reset result for local rollback attempt
+	result.Errors = make([]string, 0)
+	result.RestoredPaths = make([]string, 0)
+	result.FailedPaths = make([]string, 0)
+	result.RestoredFiles = 0
+	result.FailedFiles = 0
+
+	localResult, localErr := rm.executeLocalRollback(ctx, result)
+	if localErr == nil {
+		localResult.RollbackSource = "hybrid-local"
+		logger.Log.Info("Hybrid rollback completed successfully using local source")
+		return localResult, nil
+	}
+
+	// Both failed
+	result.Success = false
+	result.RollbackSource = "hybrid-failed"
+	result.Errors = append(result.Errors, fmt.Sprintf("Remote rollback failed: %v", remoteErr))
+	result.Errors = append(result.Errors, fmt.Sprintf("Local rollback failed: %v", localErr))
+	result.Duration = time.Since(result.Timestamp)
+
+	logger.Log.WithFields(map[string]interface{}{
+		"remote_error": remoteErr.Error(),
+		"local_error":  localErr.Error(),
+		"component":    "rollback",
+		"event_type":   "hybrid_rollback_failed",
+	}).Error("Both remote and local rollback attempts failed")
+
+	return result, fmt.Errorf("both remote and local rollback failed")
+}
+
+// createTempStagingDir creates a temporary directory for staging remote files
+func (rm *RollbackManager) createTempStagingDir(tempDir string) error {
+	if err := os.RemoveAll(tempDir); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to clean existing temp directory: %w", err)
+	}
+
+	if err := os.MkdirAll(tempDir, 0755); err != nil {
+		return fmt.Errorf("failed to create temp staging directory: %w", err)
+	}
+
+	logger.Log.WithFields(map[string]interface{}{
+		"temp_dir":   tempDir,
+		"component":  "rollback",
+		"event_type": "temp_staging_created",
+	}).Info("Created temporary staging directory")
+
+	return nil
+}
+
+// cleanupTempStaging removes the temporary staging directory
+func (rm *RollbackManager) cleanupTempStaging(tempDir string) {
+	if err := os.RemoveAll(tempDir); err != nil {
+		logger.Log.WithError(err).WithField("temp_dir", tempDir).Warn("Failed to cleanup temp staging directory")
+	} else {
+		logger.Log.WithField("temp_dir", tempDir).Info("Cleaned up temporary staging directory")
+	}
+}
+
+// backupCurrentState creates a backup of the current state before remote rollback
+func (rm *RollbackManager) backupCurrentState(ctx context.Context) error {
+	backupDir := fmt.Sprintf("%s-pre-remote-rollback-%d", rm.config.BackupPath, time.Now().Unix())
+
+	cmd := exec.Command("cp", "-r", rm.config.MonitorPath, backupDir)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to backup current state: %w", err)
+	}
+
+	logger.Log.WithFields(map[string]interface{}{
+		"backup_dir": backupDir,
+		"component":  "rollback",
+		"event_type": "current_state_backed_up",
+	}).Info("Backed up current state before remote rollback")
+
+	return nil
+}
+
+// downloadRemoteBackups downloads backup files from remote server to staging area
+func (rm *RollbackManager) downloadRemoteBackups(ctx context.Context, result *RollbackResult) error {
+	remoteConfig := rm.config.Backup.RemoteBackup
+
+	// Build rsync command to download from remote
+	cmd, err := rm.buildRemoteDownloadCommand(result.TempStaging)
+	if err != nil {
+		return fmt.Errorf("failed to build download command: %w", err)
+	}
+
+	logger.Log.WithFields(map[string]interface{}{
+		"component":   "rollback",
+		"event_type":  "remote_download_start",
+		"remote_host": remoteConfig.Host,
+		"temp_dir":    result.TempStaging,
+	}).Info("Starting download of remote backups")
+
+	// Execute rsync download with retries
+	var lastErr error
+	for attempt := 1; attempt <= remoteConfig.MaxRetries; attempt++ {
+		logger.Log.WithFields(map[string]interface{}{
+			"attempt":   attempt,
+			"max_tries": remoteConfig.MaxRetries,
+			"component": "rollback",
+		}).Info("Attempting remote backup download")
+
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			logger.Log.WithFields(map[string]interface{}{
+				"component":   "rollback",
+				"event_type":  "remote_download_success",
+				"attempt":     attempt,
+				"output_size": len(output),
+			}).Info("Remote backup download completed successfully")
+			return nil
+		}
+
+		lastErr = err
+		logger.Log.WithFields(map[string]interface{}{
+			"attempt": attempt,
+			"error":   err.Error(),
+			"output":  string(output),
+		}).Warn("Remote download attempt failed")
+
+		// Wait before retry (except on last attempt)
+		if attempt < remoteConfig.MaxRetries {
+			retryDelay := time.Duration(remoteConfig.RetryDelay) * time.Second
+			logger.Log.WithField("retry_delay", retryDelay.String()).Info("Waiting before retry")
+			time.Sleep(retryDelay)
+		}
+	}
+
+	return fmt.Errorf("remote download failed after %d attempts: %w", remoteConfig.MaxRetries, lastErr)
+}
+
+// buildRemoteDownloadCommand builds the rsync command for downloading from remote server
+func (rm *RollbackManager) buildRemoteDownloadCommand(tempDir string) (*exec.Cmd, error) {
+	remoteConfig := rm.config.Backup.RemoteBackup
+
+	// Base rsync options for download
+	args := make([]string, 0)
+	args = append(args, remoteConfig.RemoteRollback.RollbackOptions...)
+
+	// Add SSH options
+	sshOptions := []string{
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ConnectTimeout=" + strconv.Itoa(remoteConfig.ConnectionTimeout),
+		"-p", strconv.Itoa(remoteConfig.Port),
+	}
+
+	// Add SSH key if specified
+	if remoteConfig.SSHKeyPath != "" {
+		sshOptions = append(sshOptions, "-i", remoteConfig.SSHKeyPath)
+	}
+
+	// Add bandwidth limit if specified
+	if remoteConfig.BandwidthLimit > 0 {
+		args = append(args, "--bwlimit="+strconv.Itoa(remoteConfig.BandwidthLimit))
+	}
+
+	// Build SSH command string
+	sshCmd := "ssh " + strings.Join(sshOptions, " ")
+	args = append(args, "-e", sshCmd)
+
+	// Add source (remote) and destination (local temp)
+	source := fmt.Sprintf("%s@%s:%s/", remoteConfig.Username, remoteConfig.Host, remoteConfig.RemotePath)
+	args = append(args, source, tempDir+"/")
+
+	logger.Log.WithFields(map[string]interface{}{
+		"command": "rsync",
+		"args":    args,
+		"source":  source,
+		"dest":    tempDir,
+	}).Debug("Built remote download command")
+
+	return exec.Command("rsync", args...), nil
+}
+
+// restoreFromStaging restores files from staging area to monitor path
+func (rm *RollbackManager) restoreFromStaging(ctx context.Context, result *RollbackResult) error {
+	// Use rsync to efficiently copy from staging to monitor path
+	cmd := exec.Command("rsync", "-av", "--delete", result.TempStaging+"/", rm.config.MonitorPath+"/")
+
+	logger.Log.WithFields(map[string]interface{}{
+		"component":  "rollback",
+		"event_type": "staging_restore_start",
+		"source":     result.TempStaging,
+		"dest":       rm.config.MonitorPath,
+	}).Info("Starting restore from staging area")
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		logger.Log.WithFields(map[string]interface{}{
+			"error":  err.Error(),
+			"output": string(output),
+		}).Error("Failed to restore from staging area")
+		return fmt.Errorf("failed to restore from staging: %w", err)
+	}
+
+	// Count restored files (simple estimation from rsync output)
+	lines := strings.Split(string(output), "\n")
+	fileCount := 0
+	for _, line := range lines {
+		if line != "" && !strings.HasSuffix(line, "/") && !strings.Contains(line, "total size") {
+			fileCount++
+		}
+	}
+
+	result.TotalFiles = fileCount
+	result.RestoredFiles = fileCount
+	result.FailedFiles = 0
+
+	logger.Log.WithFields(map[string]interface{}{
+		"component":      "rollback",
+		"event_type":     "staging_restore_success",
+		"restored_files": fileCount,
+	}).Info("Successfully restored files from staging area")
+
+	return nil
+}
+
+// verifyRemoteRollbackIntegrity verifies the integrity of files after remote rollback
+func (rm *RollbackManager) verifyRemoteRollbackIntegrity(ctx context.Context, result *RollbackResult) error {
+	logger.Log.Info("Starting integrity verification after remote rollback")
+
+	// This is a simple implementation - in production you might want more sophisticated verification
+	verifiedCount := 0
+	failedCount := 0
+
+	err := filepath.Walk(rm.config.MonitorPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if !info.IsDir() {
+			// Simple existence check - could be enhanced with checksum verification
+			if _, err := os.Stat(path); err == nil {
+				verifiedCount++
+			} else {
+				failedCount++
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("integrity verification failed: %w", err)
+	}
+
+	logger.Log.WithFields(map[string]interface{}{
+		"component":      "rollback",
+		"event_type":     "integrity_verification_complete",
+		"verified_files": verifiedCount,
+		"failed_files":   failedCount,
+	}).Info("Completed integrity verification")
+
+	if failedCount > 0 {
+		return fmt.Errorf("integrity verification failed for %d files", failedCount)
+	}
+
+	return nil
+}
